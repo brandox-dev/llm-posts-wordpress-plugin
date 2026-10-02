@@ -3,7 +3,7 @@
 /**
  * Plugin Name: LLM Posts
  * Description: A minimal custom post type that creates posts mainly intended for LLMs to read. Serves content as Markdown when requested (via the Accept: text/markdown header).
- * Version:     1.1.0
+ * Version:     1.2.0
  * Requires at least: 5.7
  * Requires PHP: 7.1
  * Author:      Kristoffer Klintberg
@@ -48,6 +48,47 @@ function llm_post_register_cpt(): void
 add_action('init', 'llm_post_register_cpt');
 
 /**
+ * Register the "LLM Post Type" taxonomy.
+ *
+ * It classifies what kind of thing a post is (segment, fact, ...) and
+ * provides the first part of the post's identifier. It is admin-only (no
+ * front-end archives) and is edited through a one-term-only box rather than
+ * the default tag/category UI, because an identifier has exactly one prefix.
+ */
+function llm_post_register_taxonomy(): void
+{
+	register_taxonomy(
+		'llm_post_type',
+		'llm_post',
+		array(
+			'labels'             => array(
+				'name'          => __('LLM Post Types', 'llm-post'),
+				'singular_name' => __('LLM Post Type', 'llm-post'),
+				'menu_name'     => __('Post Types', 'llm-post'),
+				'all_items'     => __('All LLM post types', 'llm-post'),
+				'add_new_item'  => __('Add new LLM post type', 'llm-post'),
+				'edit_item'     => __('Edit LLM post type', 'llm-post'),
+				'search_items'  => __('Search LLM post types', 'llm-post'),
+				'not_found'     => __('No LLM post types found.', 'llm-post'),
+			),
+			'hierarchical'       => false,
+			'public'             => false,
+			'publicly_queryable' => false,
+			'show_ui'            => true,
+			'show_in_menu'       => true,
+			'show_admin_column'  => true,
+			'show_in_quick_edit' => false,
+			'show_in_rest'       => false,
+			'meta_box_cb'        => false,
+			'query_var'          => true,
+			'rewrite'            => false,
+		)
+	);
+}
+
+add_action('init', 'llm_post_register_taxonomy');
+
+/**
  * FIX: register the CPT before flushing, otherwise the flushed rules
  * do not contain /llm-post/.
  */
@@ -77,6 +118,8 @@ register_deactivation_hook(
 function llm_post_uninstall(): void
 {
 	delete_option('llm_post_archive_title');
+	delete_option('llm_post_identifier_prefix');
+	delete_option('llm_post_identifier_namespace');
 	delete_option('llm_post_header_content');
 	delete_option('llm_post_footer_content');
 }
@@ -337,6 +380,18 @@ function llm_post_render_settings_page(): void
 				: ''
 		);
 		update_option(
+			'llm_post_identifier_prefix',
+			isset($_POST['llm_post_identifier_prefix'])
+				? llm_post_sanitize_identifier(sanitize_text_field(wp_unslash($_POST['llm_post_identifier_prefix'])))
+				: ''
+		);
+		update_option(
+			'llm_post_identifier_namespace',
+			isset($_POST['llm_post_identifier_namespace'])
+				? llm_post_sanitize_identifier(sanitize_text_field(wp_unslash($_POST['llm_post_identifier_namespace'])))
+				: ''
+		);
+		update_option(
 			'llm_post_header_content',
 			isset($_POST['llm_post_header_content'])
 				? wp_kses_post(wp_unslash($_POST['llm_post_header_content']))
@@ -355,7 +410,40 @@ function llm_post_render_settings_page(): void
 			. '</p></div>';
 	}
 
+	if (
+		isset($_POST['llm_post_freeze_nonce'])
+		&& wp_verify_nonce(
+			sanitize_text_field(wp_unslash($_POST['llm_post_freeze_nonce'])),
+			'llm_post_freeze_all'
+		)
+	) {
+		$locked = 0;
+
+		foreach (llm_post_unlocked_post_ids() as $unlocked_id) {
+			$unlocked_post = get_post($unlocked_id);
+
+			if ($unlocked_post instanceof WP_Post) {
+				llm_post_freeze_identifier($unlocked_post);
+				$locked++;
+			}
+		}
+
+		echo '<div class="notice notice-success"><p>'
+			. esc_html(
+				sprintf(
+					/* translators: %d: number of posts. */
+					_n('Locked the identifier of %d post.', 'Locked the identifiers of %d posts.', $locked, 'llm-post'),
+					$locked
+				)
+			)
+			. '</p></div>';
+	}
+
+	$unlocked_count = count(llm_post_unlocked_post_ids());
+
 	$archive_title = (string) get_option('llm_post_archive_title', '');
+	$id_prefix     = (string) get_option('llm_post_identifier_prefix', '');
+	$id_namespace  = (string) get_option('llm_post_identifier_namespace', '');
 	$header        = (string) get_option('llm_post_header_content', '');
 	$footer        = (string) get_option('llm_post_footer_content', '');
 
@@ -381,6 +469,49 @@ function llm_post_render_settings_page(): void
 							class="regular-text" />
 						<p class="description">
 							<?php esc_html_e('Title shown on the archive page (/llm-post/) in both the HTML and Markdown output. Leave blank to use the default post type label.', 'llm-post'); ?>
+						</p>
+					</td>
+				</tr>
+				<tr>
+					<th scope="row">
+						<label for="llm_post_identifier_prefix"><?php esc_html_e('Identifier prefix', 'llm-post'); ?></label>
+					</th>
+					<td>
+						<input
+							type="text"
+							id="llm_post_identifier_prefix"
+							name="llm_post_identifier_prefix"
+							value="<?php echo esc_attr($id_prefix); ?>"
+							placeholder="llm"
+							class="regular-text" />
+						<p class="description">
+							<?php esc_html_e('Fallback first part of the identifier, used for posts that have no LLM post type (a post type sets its own prefix). Leave blank to use "llm".', 'llm-post'); ?>
+						</p>
+					</td>
+				</tr>
+				<tr>
+					<th scope="row">
+						<label for="llm_post_identifier_namespace"><?php esc_html_e('Identifier namespace', 'llm-post'); ?></label>
+					</th>
+					<td>
+						<input
+							type="text"
+							id="llm_post_identifier_namespace"
+							name="llm_post_identifier_namespace"
+							value="<?php echo esc_attr($id_namespace); ?>"
+							placeholder="<?php echo esc_attr(llm_post_default_namespace()); ?>"
+							class="regular-text" />
+						<p class="description">
+							<?php
+							printf(
+								/* translators: %s: example identifier. */
+								esc_html__('Middle part of every generated post identifier, e.g. "brandox". Leave blank to use the site host. Result: %s', 'llm-post'),
+								'<code>' . esc_html(llm_post_identifier_example()) . '</code>'
+							);
+							?>
+						</p>
+						<p class="description">
+							<?php esc_html_e('Identifiers are locked when a post is published, so changing these only affects posts that are not locked yet (drafts, and older posts until you lock them below). Posts with their own llm_post_identifier custom field are never affected.', 'llm-post'); ?>
 						</p>
 					</td>
 				</tr>
@@ -416,6 +547,27 @@ function llm_post_render_settings_page(): void
 				</tr>
 			</table>
 			<?php submit_button(); ?>
+		</form>
+
+		<hr>
+		<h2><?php esc_html_e('Lock identifiers', 'llm-post'); ?></h2>
+		<p>
+			<?php esc_html_e('An identifier is locked the first time a post is published, so later changes to its slug, type or these settings do not change it. Published posts that are not locked yet still follow the settings above.', 'llm-post'); ?>
+		</p>
+		<p>
+			<?php
+			echo esc_html(
+				sprintf(
+					/* translators: %d: number of posts. */
+					_n('%d published post is not locked yet.', '%d published posts are not locked yet.', $unlocked_count, 'llm-post'),
+					$unlocked_count
+				)
+			);
+			?>
+		</p>
+		<form method="post">
+			<?php wp_nonce_field('llm_post_freeze_all', 'llm_post_freeze_nonce'); ?>
+			<?php submit_button(__('Lock identifiers of all published posts now', 'llm-post'), 'secondary', 'submit', false, 0 === $unlocked_count ? array('disabled' => 'disabled') : array()); ?>
 		</form>
 	</div>
 <?php
@@ -512,52 +664,141 @@ function llm_post_sanitize_identifier(string $identifier): string
 }
 
 /**
- * Return the stable identifier for an LLM post.
- *
- * A custom field named `llm_post_identifier` can be used when a specific
- * semantic identifier is required, e.g.:
- *
- *     segment.example.com.office_parking
- *
- * Otherwise the identifier is generated from:
- *
- *     llm.<site-host>.<post-slug>
- *
- * The prefix is filterable so a site can use a namespace such as `segment`
- * without the plugin having to assume that every LLM post is a segment.
+ * Default identifier namespace: the site host without "www.".
+ */
+function llm_post_default_namespace(): string
+{
+	$host = (string) wp_parse_url(home_url('/'), PHP_URL_HOST);
+	$host = preg_replace('/^www\./i', '', $host);
+
+	return llm_post_sanitize_identifier(null === $host ? '' : $host);
+}
+
+/**
+ * Fallback identifier prefix from the settings page (default "llm"), used
+ * for posts that have no LLM post type.
+ */
+function llm_post_get_prefix(): string
+{
+	$prefix = llm_post_sanitize_identifier(
+		(string) get_option('llm_post_identifier_prefix', '')
+	);
+
+	return '' !== $prefix ? $prefix : 'llm';
+}
+
+/**
+ * Identifier namespace from the settings page (default: the site host).
+ */
+function llm_post_get_namespace(): string
+{
+	$namespace = llm_post_sanitize_identifier(
+		(string) get_option('llm_post_identifier_namespace', '')
+	);
+
+	return '' !== $namespace ? $namespace : llm_post_default_namespace();
+}
+
+/**
+ * Example identifier built from the current settings, for the settings page.
+ */
+function llm_post_identifier_example(): string
+{
+	return implode(
+		'.',
+		array_filter(
+			array(llm_post_get_prefix(), llm_post_get_namespace(), 'example-post'),
+			'strlen'
+		)
+	);
+}
+
+/**
+ * The explicit identifier set through the `llm_post_identifier` custom
+ * field, sanitized. Empty when not set.
  *
  * @param WP_Post $post Post object.
  * @return string
  */
-function llm_post_get_identifier(WP_Post $post): string
+function llm_post_get_custom_identifier(WP_Post $post): string
 {
-	$custom = trim(
-		(string) get_post_meta(
-			$post->ID,
-			'llm_post_identifier',
-			true
-		)
+	$custom = trim((string) get_post_meta($post->ID, 'llm_post_identifier', true));
+
+	return '' === $custom ? '' : llm_post_sanitize_identifier($custom);
+}
+
+/**
+ * The LLM post type term of a post (one at most), or null.
+ *
+ * @param WP_Post $post Post object.
+ * @return WP_Term|null
+ */
+function llm_post_get_type_term(WP_Post $post)
+{
+	$terms = get_the_terms($post, 'llm_post_type');
+
+	if (!is_array($terms) || empty($terms)) {
+		return null;
+	}
+
+	$term = reset($terms);
+
+	return $term instanceof WP_Term ? $term : null;
+}
+
+/**
+ * The identifier prefix of an LLM post type term: its own "Identifier
+ * prefix" field, or the term slug if that is empty.
+ *
+ * @param WP_Term $term Term.
+ * @return string
+ */
+function llm_post_get_term_prefix(WP_Term $term): string
+{
+	$prefix = llm_post_sanitize_identifier(
+		(string) get_term_meta($term->term_id, 'llm_post_type_prefix', true)
 	);
 
-	if ('' !== $custom) {
-		$identifier = llm_post_sanitize_identifier($custom);
+	return '' !== $prefix ? $prefix : llm_post_sanitize_identifier($term->slug);
+}
 
-		if ('' !== $identifier) {
-			return (string) apply_filters(
-				'llm_post_identifier',
-				$identifier,
-				$post
-			);
+/**
+ * The identifier prefix for a post: its type's prefix, or the global
+ * fallback prefix from the settings page when it has no type.
+ *
+ * @param WP_Post $post Post object.
+ * @return string
+ */
+function llm_post_get_post_prefix(WP_Post $post): string
+{
+	$term = llm_post_get_type_term($post);
+
+	if ($term) {
+		$prefix = llm_post_get_term_prefix($term);
+
+		if ('' !== $prefix) {
+			return $prefix;
 		}
 	}
 
-	$host = (string) wp_parse_url(
-		home_url('/'),
-		PHP_URL_HOST
-	);
-	$host = preg_replace('/^www\./i', '', $host);
-	$host = llm_post_sanitize_identifier(
-		null === $host ? '' : $host
+	return llm_post_get_prefix();
+}
+
+/**
+ * Generate (without storing) the identifier for a post from its type,
+ * the namespace and its slug: <prefix>.<namespace>.<slug>
+ *
+ * @param WP_Post $post Post object.
+ * @return string
+ */
+function llm_post_generate_identifier(WP_Post $post): string
+{
+	$namespace = llm_post_sanitize_identifier(
+		(string) apply_filters(
+			'llm_post_identifier_namespace',
+			llm_post_get_namespace(),
+			$post
+		)
 	);
 
 	$slug = trim((string) $post->post_name);
@@ -568,38 +809,384 @@ function llm_post_get_identifier(WP_Post $post): string
 
 	$slug = llm_post_sanitize_identifier($slug);
 
-	$prefix = (string) apply_filters(
-		'llm_post_identifier_prefix',
-		'llm',
-		$post
+	$prefix = llm_post_sanitize_identifier(
+		(string) apply_filters(
+			'llm_post_identifier_prefix',
+			llm_post_get_post_prefix($post),
+			$post
+		)
 	);
-	$prefix = llm_post_sanitize_identifier($prefix);
 
 	$parts = array();
 
-	if ('' !== $prefix) {
-		$parts[] = $prefix;
-	}
-
-	if ('' !== $host) {
-		$parts[] = $host;
-	}
-
-	if ('' !== $slug) {
-		$parts[] = $slug;
+	foreach (array($prefix, $namespace, $slug) as $part) {
+		if ('' !== $part) {
+			$parts[] = $part;
+		}
 	}
 
 	$identifier = implode('.', $parts);
 
-	if ('' === $identifier) {
-		$identifier = 'llm-post-' . (int) $post->ID;
+	return '' === $identifier ? 'llm-post-' . (int) $post->ID : $identifier;
+}
+
+/**
+ * The locked identifier of a post (stored when it was first published), or
+ * '' if the post is not locked yet.
+ *
+ * @param WP_Post $post Post object.
+ * @return string
+ */
+function llm_post_get_locked_identifier(WP_Post $post): string
+{
+	return trim((string) get_post_meta($post->ID, '_llm_post_identifier', true));
+}
+
+/**
+ * Lock the identifier of a post by storing the generated value. Does
+ * nothing if the post is already locked or has its own custom identifier.
+ *
+ * @param WP_Post $post Post object.
+ */
+function llm_post_freeze_identifier(WP_Post $post): void
+{
+	if ('' !== llm_post_get_custom_identifier($post)) {
+		return;
 	}
 
-	return (string) apply_filters(
-		'llm_post_identifier',
-		$identifier,
-		$post
+	if ('' !== llm_post_get_locked_identifier($post)) {
+		return;
+	}
+
+	update_post_meta($post->ID, '_llm_post_identifier', llm_post_generate_identifier($post));
+}
+
+/**
+ * IDs of published LLM posts whose identifier is not locked and that have
+ * no custom identifier.
+ *
+ * @return int[]
+ */
+function llm_post_unlocked_post_ids(): array
+{
+	$query = new WP_Query(
+		array(
+			'post_type'              => 'llm_post',
+			'post_status'            => 'publish',
+			'posts_per_page'         => -1,
+			'fields'                 => 'ids',
+			'no_found_rows'          => true,
+			'update_post_term_cache' => false,
+			'meta_query'             => array(
+				'relation' => 'AND',
+				array(
+					'key'     => '_llm_post_identifier',
+					'compare' => 'NOT EXISTS',
+				),
+				array(
+					'key'     => 'llm_post_identifier',
+					'compare' => 'NOT EXISTS',
+				),
+			),
+		)
 	);
+
+	return array_map('intval', $query->posts);
+}
+
+/**
+ * Return the stable identifier for an LLM post.
+ *
+ * In order of priority:
+ *
+ * 1. The custom field `llm_post_identifier`, when a specific semantic
+ *    identifier is required, e.g. `segment.example.office_parking`.
+ * 2. The identifier locked when the post was first published.
+ * 3. A generated identifier (used for drafts and for published posts that
+ *    are not locked yet):
+ *
+ *        <prefix>.<namespace>.<post-slug>
+ *
+ *    - prefix: the prefix of the post's LLM post type (default: the term
+ *      slug), or the fallback prefix from the settings page (default `llm`)
+ *    - namespace: from the settings page (default: the site host without
+ *      `www.`)
+ *
+ * Prefix and namespace are also filterable (`llm_post_identifier_prefix`,
+ * `llm_post_identifier_namespace`), and the final value is filterable via
+ * `llm_post_identifier`.
+ *
+ * @param WP_Post $post Post object.
+ * @return string
+ */
+function llm_post_get_identifier(WP_Post $post): string
+{
+	$identifier = llm_post_get_custom_identifier($post);
+
+	if ('' === $identifier) {
+		$identifier = llm_post_get_locked_identifier($post);
+	}
+
+	if ('' === $identifier) {
+		$identifier = llm_post_generate_identifier($post);
+	}
+
+	return (string) apply_filters('llm_post_identifier', $identifier, $post);
+}
+
+/**
+ * Lock the identifier when a post is published by means other than the
+ * editor (scheduled publishing, quick edit, ...). Editor saves are handled
+ * by the "Type & identifier" box, after the type has been saved, and REST
+ * requests are skipped for the same reason (the block editor saves the
+ * post first and the box second).
+ */
+add_action(
+	'transition_post_status',
+	function ($new_status, $old_status, $post) {
+		if ('publish' !== $new_status || 'publish' === $old_status) {
+			return;
+		}
+
+		if (!$post instanceof WP_Post || 'llm_post' !== $post->post_type) {
+			return;
+		}
+
+		if (defined('REST_REQUEST') && REST_REQUEST) {
+			return;
+		}
+
+		if (isset($_POST['llm_post_type_nonce'])) {
+			return;
+		}
+
+		llm_post_freeze_identifier($post);
+	},
+	10,
+	3
+);
+
+/* --- LLM post type: term prefix field --- */
+
+add_action(
+	'llm_post_type_add_form_fields',
+	function () {
+?>
+	<div class="form-field">
+		<label for="llm_post_type_prefix"><?php esc_html_e('Identifier prefix', 'llm-post'); ?></label>
+		<input type="text" name="llm_post_type_prefix" id="llm_post_type_prefix" value="" />
+		<p><?php esc_html_e('First part of the identifier of posts with this type, e.g. "segment". Leave blank to use the slug. Locked identifiers of already published posts do not change.', 'llm-post'); ?></p>
+	</div>
+<?php
+	}
+);
+
+add_action(
+	'llm_post_type_edit_form_fields',
+	function ($term) {
+		$value = (string) get_term_meta($term->term_id, 'llm_post_type_prefix', true);
+?>
+	<tr class="form-field">
+		<th scope="row">
+			<label for="llm_post_type_prefix"><?php esc_html_e('Identifier prefix', 'llm-post'); ?></label>
+		</th>
+		<td>
+			<input type="text" name="llm_post_type_prefix" id="llm_post_type_prefix" value="<?php echo esc_attr($value); ?>" />
+			<p class="description"><?php esc_html_e('First part of the identifier of posts with this type, e.g. "segment". Leave blank to use the slug. Locked identifiers of already published posts do not change.', 'llm-post'); ?></p>
+		</td>
+	</tr>
+<?php
+	}
+);
+
+/**
+ * Save the term prefix. WordPress has already verified the term form's
+ * nonce at this point.
+ *
+ * @param int $term_id Term ID.
+ */
+function llm_post_save_term_prefix($term_id): void
+{
+	if (!isset($_POST['llm_post_type_prefix'])) {
+		return;
+	}
+
+	$taxonomy = get_taxonomy('llm_post_type');
+
+	if (!$taxonomy || !current_user_can($taxonomy->cap->edit_terms)) {
+		return;
+	}
+
+	$value = llm_post_sanitize_identifier(
+		sanitize_text_field(wp_unslash($_POST['llm_post_type_prefix']))
+	);
+
+	if ('' === $value) {
+		delete_term_meta($term_id, 'llm_post_type_prefix');
+	} else {
+		update_term_meta($term_id, 'llm_post_type_prefix', $value);
+	}
+}
+
+add_action('created_llm_post_type', 'llm_post_save_term_prefix');
+add_action('edited_llm_post_type', 'llm_post_save_term_prefix');
+
+/* --- LLM post type: "Type & identifier" box in the post editor --- */
+
+add_action(
+	'add_meta_boxes_llm_post',
+	function () {
+		add_meta_box(
+			'llm_post_type_box',
+			__('Type & identifier', 'llm-post'),
+			'llm_post_render_type_box',
+			'llm_post',
+			'side',
+			'default'
+		);
+	}
+);
+
+/**
+ * Render the "Type & identifier" box: a one-choice type picker, plus the
+ * current identifier and whether it is locked.
+ *
+ * @param WP_Post $post Post being edited.
+ */
+function llm_post_render_type_box(WP_Post $post): void
+{
+	$terms = get_terms(
+		array(
+			'taxonomy'   => 'llm_post_type',
+			'hide_empty' => false,
+		)
+	);
+
+	if (is_wp_error($terms)) {
+		$terms = array();
+	}
+
+	$current    = llm_post_get_type_term($post);
+	$current_id = $current ? (int) $current->term_id : 0;
+	$locked     = llm_post_get_locked_identifier($post);
+	$custom     = llm_post_get_custom_identifier($post);
+
+	wp_nonce_field('llm_post_save_type', 'llm_post_type_nonce');
+
+?>
+	<p><strong><?php esc_html_e('Type', 'llm-post'); ?></strong></p>
+	<ul style="margin: 0 0 8px;">
+		<li>
+			<label>
+				<input type="radio" name="llm_post_type_term" value="0" <?php checked(0, $current_id); ?> />
+				<?php
+				printf(
+					/* translators: %s: fallback prefix. */
+					esc_html__('None (prefix: %s)', 'llm-post'),
+					'<code>' . esc_html(llm_post_get_prefix()) . '</code>'
+				);
+				?>
+			</label>
+		</li>
+		<?php foreach ($terms as $term) : ?>
+			<li>
+				<label>
+					<input type="radio" name="llm_post_type_term" value="<?php echo (int) $term->term_id; ?>" <?php checked((int) $term->term_id, $current_id); ?> />
+					<?php echo esc_html($term->name); ?>
+					<code><?php echo esc_html(llm_post_get_term_prefix($term)); ?></code>
+				</label>
+			</li>
+		<?php endforeach; ?>
+	</ul>
+	<?php if (empty($terms)) : ?>
+		<p class="description">
+			<a href="<?php echo esc_url(admin_url('edit-tags.php?taxonomy=llm_post_type&post_type=llm_post')); ?>">
+				<?php esc_html_e('Add an LLM post type', 'llm-post'); ?>
+			</a>
+		</p>
+	<?php endif; ?>
+
+	<p><strong><?php esc_html_e('Identifier', 'llm-post'); ?></strong></p>
+	<p><code><?php echo esc_html(llm_post_get_identifier($post)); ?></code></p>
+
+	<?php if ('' !== $custom) : ?>
+		<p class="description"><?php esc_html_e('Set by the llm_post_identifier custom field.', 'llm-post'); ?></p>
+	<?php elseif ('' !== $locked) : ?>
+		<p class="description"><?php esc_html_e('Locked when the post was published, so changing the slug or type does not change it.', 'llm-post'); ?></p>
+		<p>
+			<label>
+				<input type="checkbox" name="llm_post_regenerate_id" value="1" />
+				<?php esc_html_e('Regenerate on save (the identifier changes!)', 'llm-post'); ?>
+			</label>
+		</p>
+	<?php else : ?>
+		<p class="description"><?php esc_html_e('Not final yet: it is locked when the post is published. Save to update this preview after changing the type or slug.', 'llm-post'); ?></p>
+	<?php endif; ?>
+<?php
+}
+
+/**
+ * Save the type, then (for published posts) lock the identifier.
+ *
+ * Runs after the type has been saved, so the locked identifier uses the
+ * right prefix. In the block editor this is the second request of a save.
+ */
+add_action(
+	'save_post_llm_post',
+	function ($post_id) {
+		if (defined('DOING_AUTOSAVE') && DOING_AUTOSAVE) {
+			return;
+		}
+
+		if (
+			!isset($_POST['llm_post_type_nonce'])
+			|| !wp_verify_nonce(
+				sanitize_text_field(wp_unslash($_POST['llm_post_type_nonce'])),
+				'llm_post_save_type'
+			)
+		) {
+			return;
+		}
+
+		if (!current_user_can('edit_post', $post_id)) {
+			return;
+		}
+
+		$taxonomy = get_taxonomy('llm_post_type');
+
+		if ($taxonomy && isset($_POST['llm_post_type_term']) && current_user_can($taxonomy->cap->assign_terms)) {
+			$term_id = absint(wp_unslash($_POST['llm_post_type_term']));
+
+			if ($term_id > 0 && get_term($term_id, 'llm_post_type') instanceof WP_Term) {
+				wp_set_object_terms($post_id, array($term_id), 'llm_post_type');
+			} else {
+				wp_set_object_terms($post_id, array(), 'llm_post_type');
+			}
+		}
+
+		if (!empty($_POST['llm_post_regenerate_id'])) {
+			delete_post_meta($post_id, '_llm_post_identifier');
+		}
+
+		$post = get_post($post_id);
+
+		if ($post instanceof WP_Post && 'publish' === $post->post_status) {
+			llm_post_freeze_identifier($post);
+		}
+	}
+);
+
+/**
+ * The slug of the post's LLM post type, or '' if it has none.
+ *
+ * @param WP_Post $post Post object.
+ * @return string
+ */
+function llm_post_get_type_slug(WP_Post $post): string
+{
+	$term = llm_post_get_type_term($post);
+
+	return $term ? $term->slug : '';
 }
 
 /**
@@ -873,6 +1460,14 @@ add_action(
 			. esc_attr(llm_post_get_identifier($post))
 			. '">' . "\n";
 
+		$type_slug = llm_post_get_type_slug($post);
+
+		if ('' !== $type_slug) {
+			echo '<meta name="llm-post-type" content="'
+				. esc_attr($type_slug)
+				. '">' . "\n";
+		}
+
 		foreach (llm_post_get_dates($post) as $key => $date) {
 			echo '<meta name="llm-post-' . esc_attr($key) . '" content="'
 				. esc_attr($date['iso'])
@@ -1008,6 +1603,11 @@ function llm_post_to_markdown(WP_Post $post): string
 
 	$front_matter  = "---\n";
 	$front_matter .= 'id: ' . llm_post_yaml_scalar(llm_post_get_identifier($post)) . "\n";
+
+	if ('' !== llm_post_get_type_slug($post)) {
+		$front_matter .= 'type: ' . llm_post_yaml_scalar(llm_post_get_type_slug($post)) . "\n";
+	}
+
 	$front_matter .= 'title: ' . llm_post_yaml_scalar(llm_post_plain_text(get_the_title($post))) . "\n";
 	$front_matter .= 'date: ' . llm_post_yaml_scalar(get_the_date('c', $post)) . "\n";
 
