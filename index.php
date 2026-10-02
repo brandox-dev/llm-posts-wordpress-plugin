@@ -14,6 +14,9 @@ if (!defined('ABSPATH')) {
 	exit;
 }
 
+// Make sure we always use the plugin template instead of the theme template(s).
+define('LLM_POST_FORCE_FALLBACK_TEMPLATE', true);
+
 /* ------------------------------------------------------------------------
  * 1. Custom post type, activation, deactivation, uninstall
  * --------------------------------------------------------------------- */
