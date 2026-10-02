@@ -172,8 +172,9 @@ function llm_post_accepts_markdown(string $accept): bool
 }
 
 /**
- * FIX: make the main archive query use the same page size as the Markdown
- * output, so `paged` and 404 handling are consistent.
+ * Make the main archive query use the same (large) page size for HTML and
+ * Markdown, so the overview lists (nearly) all posts and `paged` / 404
+ * handling stay consistent between the two representations.
  */
 add_action(
 	'pre_get_posts',
@@ -183,10 +184,6 @@ add_action(
 		}
 
 		if (!$query->is_post_type_archive('llm_post')) {
-			return;
-		}
-
-		if (!llm_post_request_wants_markdown()) {
 			return;
 		}
 
@@ -497,6 +494,173 @@ function llm_post_get_common_markdown(string $which): string
 	return '' === $html ? '' : trim(llm_post_html_to_markdown($html));
 }
 
+/**
+ * Sanitize an LLM post identifier.
+ *
+ * Identifiers are intended for machine use, so keep them predictable and
+ * limited to letters, numbers, dots, underscores and hyphens.
+ *
+ * @param string $identifier Identifier to sanitize.
+ * @return string
+ */
+function llm_post_sanitize_identifier(string $identifier): string
+{
+	$identifier = strtolower(trim($identifier));
+	$identifier = preg_replace('/[^a-z0-9._-]+/i', '_', $identifier);
+
+	return trim(null === $identifier ? '' : $identifier, '._-');
+}
+
+/**
+ * Return the stable identifier for an LLM post.
+ *
+ * A custom field named `llm_post_identifier` can be used when a specific
+ * semantic identifier is required, e.g.:
+ *
+ *     segment.example.com.office_parking
+ *
+ * Otherwise the identifier is generated from:
+ *
+ *     llm.<site-host>.<post-slug>
+ *
+ * The prefix is filterable so a site can use a namespace such as `segment`
+ * without the plugin having to assume that every LLM post is a segment.
+ *
+ * @param WP_Post $post Post object.
+ * @return string
+ */
+function llm_post_get_identifier(WP_Post $post): string
+{
+	$custom = trim(
+		(string) get_post_meta(
+			$post->ID,
+			'llm_post_identifier',
+			true
+		)
+	);
+
+	if ('' !== $custom) {
+		$identifier = llm_post_sanitize_identifier($custom);
+
+		if ('' !== $identifier) {
+			return (string) apply_filters(
+				'llm_post_identifier',
+				$identifier,
+				$post
+			);
+		}
+	}
+
+	$host = (string) wp_parse_url(
+		home_url('/'),
+		PHP_URL_HOST
+	);
+	$host = preg_replace('/^www\./i', '', $host);
+	$host = llm_post_sanitize_identifier(
+		null === $host ? '' : $host
+	);
+
+	$slug = trim((string) $post->post_name);
+
+	if ('' === $slug) {
+		$slug = sanitize_title(get_the_title($post));
+	}
+
+	$slug = llm_post_sanitize_identifier($slug);
+
+	$prefix = (string) apply_filters(
+		'llm_post_identifier_prefix',
+		'llm',
+		$post
+	);
+	$prefix = llm_post_sanitize_identifier($prefix);
+
+	$parts = array();
+
+	if ('' !== $prefix) {
+		$parts[] = $prefix;
+	}
+
+	if ('' !== $host) {
+		$parts[] = $host;
+	}
+
+	if ('' !== $slug) {
+		$parts[] = $slug;
+	}
+
+	$identifier = implode('.', $parts);
+
+	if ('' === $identifier) {
+		$identifier = 'llm-post-' . (int) $post->ID;
+	}
+
+	return (string) apply_filters(
+		'llm_post_identifier',
+		$identifier,
+		$post
+	);
+}
+
+/**
+ * Advertise the LLM post identifier in the HTML <head>.
+ *
+ * This works even when the active theme supplies the single-post template.
+ */
+add_action(
+	'wp_head',
+	function () {
+		if (!is_singular('llm_post')) {
+			return;
+		}
+
+		$post = get_queried_object();
+
+		if (!$post instanceof WP_Post) {
+			return;
+		}
+
+		echo '<meta name="llm-post-id" content="'
+			. esc_attr(llm_post_get_identifier($post))
+			. '">' . "\n";
+	},
+	20
+);
+
+/**
+ * Add the identifier visibly to the rendered LLM post content.
+ *
+ * This also makes the identifier available to normal HTML/theme templates,
+ * while the Markdown representation gets it separately in its front matter.
+ */
+add_filter(
+	'the_content',
+	function ($content) {
+		if (
+			is_admin()
+			|| !is_singular('llm_post')
+			|| !in_the_loop()
+			|| !is_main_query()
+		) {
+			return $content;
+		}
+
+		$post = get_queried_object();
+
+		if (!$post instanceof WP_Post) {
+			return $content;
+		}
+
+		$identifier = llm_post_get_identifier($post);
+
+		return '<p class="llm-post-identifier"><strong>ID:</strong> '
+			. esc_html($identifier)
+			. '</p>'
+			. $content;
+	},
+	5
+);
+
 /* ------------------------------------------------------------------------
  * 4. Markdown rendering
  * --------------------------------------------------------------------- */
@@ -574,6 +738,7 @@ function llm_post_to_markdown(WP_Post $post): string
 	llm_post_base_url((string) get_permalink($post));
 
 	$front_matter  = "---\n";
+	$front_matter .= 'id: ' . llm_post_yaml_scalar(llm_post_get_identifier($post)) . "\n";
 	$front_matter .= 'title: ' . llm_post_yaml_scalar(llm_post_plain_text(get_the_title($post))) . "\n";
 	$front_matter .= 'date: ' . llm_post_yaml_scalar(get_the_date('c', $post)) . "\n";
 	$front_matter .= 'author: ' . llm_post_yaml_scalar(
@@ -1488,10 +1653,25 @@ function llm_post_markdown_destination(string $url): string
 }
 
 /**
+ * Make a string safe for use inside a Markdown table cell.
+ *
+ * A literal pipe would start a new column and a newline would end the row.
+ *
+ * @param string $text Cell content (already Markdown-escaped).
+ * @return string
+ */
+function llm_post_archive_table_cell(string $text): string
+{
+	$text = str_replace('|', '\\|', $text);
+
+	return trim((string) preg_replace('/\s*(?:\r\n|\r|\n)\s*/', ' ', $text));
+}
+
+/**
  * Render the LLM post archive as Markdown.
  *
- * Yields a YAML front matter block, an H1 title, and a bullet list of
- * posts with a short excerpt for each. Page size is capped (filterable via
+ * Yields a YAML front matter block, an H1 title, and a table of posts with
+ * their title, URL and LLM post identifier. Page size is capped (filterable via
  * `llm_post_archive_markdown_per_page`) and the front matter exposes
  * page / total_pages / next / previous so an agent can walk the catalogue.
  *
@@ -1548,27 +1728,23 @@ function llm_post_archive_to_markdown(): string
 	if (empty($query->posts)) {
 		$out .= "_No LLM posts yet._\n";
 	} else {
+		$out .= "| Title | URL | ID |\n";
+		$out .= "| --- | --- | --- |\n";
+
 		foreach ($query->posts as $post) {
-			$permalink  = (string) get_permalink($post);
-			$post_title = llm_post_plain_text(get_the_title($post));
-
-			$line = '- ['
-				. llm_post_markdown_text($post_title)
-				. ']('
-				. llm_post_markdown_destination($permalink)
-				. ')';
-
-			/*
-			 * A short excerpt helps an agent decide which posts to fetch
-			 * without pulling every document.
-			 */
-			$excerpt = llm_post_excerpt($post);
-
-			if ('' !== $excerpt) {
-				$line .= ' — ' . llm_post_markdown_text($excerpt);
-			}
-
-			$out .= $line . "\n";
+			$out .= '| '
+				. llm_post_archive_table_cell(
+					llm_post_markdown_text(llm_post_plain_text(get_the_title($post)))
+				)
+				. ' | '
+				. llm_post_archive_table_cell(
+					llm_post_sanitize_markdown_url((string) get_permalink($post))
+				)
+				. ' | '
+				. llm_post_archive_table_cell(
+					llm_post_inline_code(llm_post_get_identifier($post))
+				)
+				. " |\n";
 		}
 	}
 
@@ -1776,18 +1952,29 @@ function llm_post_render_archive_fallback_template(): void
 	?>
 	<main>
 		<?php if (have_posts()) : ?>
-			<ul>
-				<?php
-				while (have_posts()) :
-					the_post();
-				?>
-					<li>
-						<a href="<?php the_permalink(); ?>"><?php the_title(); ?></a>
-					</li>
-				<?php
-				endwhile;
-				?>
-			</ul>
+			<table class="llm-post-archive-table">
+				<thead>
+					<tr>
+						<th scope="col"><?php esc_html_e('Title', 'llm-post'); ?></th>
+						<th scope="col"><?php esc_html_e('URL', 'llm-post'); ?></th>
+						<th scope="col"><?php esc_html_e('ID', 'llm-post'); ?></th>
+					</tr>
+				</thead>
+				<tbody>
+					<?php
+					while (have_posts()) :
+						the_post();
+					?>
+						<tr>
+							<td><a href="<?php the_permalink(); ?>"><?php the_title(); ?></a></td>
+							<td><code><?php echo esc_html(wp_make_link_relative(get_permalink())); ?></code></td>
+							<td><code><?php echo esc_html(llm_post_get_identifier(get_post())); ?></code></td>
+						</tr>
+					<?php
+					endwhile;
+					?>
+				</tbody>
+			</table>
 			<?php
 			the_posts_pagination(
 				array(
