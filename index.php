@@ -3,7 +3,7 @@
 /**
  * Plugin Name: LLM Posts
  * Description: A minimal custom post type that creates posts mainly intended for LLMs to read. Serves content as Markdown when requested (via the Accept: text/markdown header).
- * Version:     1.0.0
+ * Version:     1.1.0
  * Requires at least: 5.7
  * Requires PHP: 7.1
  * Author:      Kristoffer Klintberg
