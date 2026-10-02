@@ -603,7 +603,256 @@ function llm_post_get_identifier(WP_Post $post): string
 }
 
 /**
- * Advertise the LLM post identifier in the HTML <head>.
+ * Register the "Verified" custom field so it is available in the REST API
+ * and the block editor's custom fields panel.
+ */
+add_action(
+	'init',
+	function () {
+		register_post_meta(
+			'llm_post',
+			'llm_post_verified',
+			array(
+				'type'              => 'string',
+				'single'            => true,
+				'show_in_rest'      => true,
+				'sanitize_callback' => 'llm_post_sanitize_verified_date',
+				'auth_callback'     => function () {
+					return current_user_can('edit_posts');
+				},
+			)
+		);
+	}
+);
+
+/**
+ * Sanitize the "Verified" custom field. Accepts YYYY-MM or YYYY-MM-DD;
+ * anything else is discarded (an empty value means "not set").
+ *
+ * @param mixed $value Raw value.
+ * @return string
+ */
+function llm_post_sanitize_verified_date($value): string
+{
+	$value = trim((string) $value);
+
+	return preg_match('/^\d{4}-(0[1-9]|1[0-2])(-(0[1-9]|[12]\d|3[01]))?$/', $value)
+		? $value
+		: '';
+}
+
+/**
+ * "Verified" box in the post editor (works in the block editor and the
+ * classic editor), so the date can be set without enabling the Custom
+ * Fields panel.
+ */
+add_action(
+	'add_meta_boxes_llm_post',
+	function () {
+		add_meta_box(
+			'llm_post_verified_box',
+			__('Verified', 'llm-post'),
+			'llm_post_render_verified_box',
+			'llm_post',
+			'side',
+			'default'
+		);
+	}
+);
+
+/**
+ * Render the "Verified" box.
+ *
+ * @param WP_Post $post Post being edited.
+ */
+function llm_post_render_verified_box(WP_Post $post): void
+{
+	$value = llm_post_sanitize_verified_date(
+		(string) get_post_meta($post->ID, 'llm_post_verified', true)
+	);
+
+	/* A month-only value (YYYY-MM) can't be shown in a date input. */
+	if (7 === strlen($value)) {
+		$value .= '-01';
+	}
+
+	wp_nonce_field('llm_post_save_verified', 'llm_post_verified_nonce');
+
+?>
+	<p>
+		<label for="llm_post_verified_field">
+			<?php esc_html_e('Date someone last checked that this content is still correct.', 'llm-post'); ?>
+		</label>
+	</p>
+	<p>
+		<input
+			type="date"
+			id="llm_post_verified_field"
+			name="llm_post_verified_field"
+			value="<?php echo esc_attr($value); ?>" />
+		<button type="button" class="button" id="llm_post_verified_today">
+			<?php esc_html_e('Today', 'llm-post'); ?>
+		</button>
+	</p>
+	<p class="description">
+		<?php esc_html_e('Leave empty to show the Updated date as Verified. Remember to click Update afterwards.', 'llm-post'); ?>
+	</p>
+	<script>
+		(function() {
+			var button = document.getElementById('llm_post_verified_today');
+			var input = document.getElementById('llm_post_verified_field');
+
+			if (!button || !input) {
+				return;
+			}
+
+			button.addEventListener('click', function() {
+				var d = new Date();
+				var pad = function(n) {
+					return (n < 10 ? '0' : '') + n;
+				};
+
+				input.value = d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate());
+				input.dispatchEvent(new Event('change', {
+					bubbles: true
+				}));
+			});
+		}());
+	</script>
+<?php
+}
+
+/**
+ * Save the "Verified" box.
+ *
+ * @param int $post_id Post ID.
+ */
+add_action(
+	'save_post_llm_post',
+	function ($post_id) {
+		if (defined('DOING_AUTOSAVE') && DOING_AUTOSAVE) {
+			return;
+		}
+
+		if (
+			!isset($_POST['llm_post_verified_nonce'])
+			|| !wp_verify_nonce(
+				sanitize_text_field(wp_unslash($_POST['llm_post_verified_nonce'])),
+				'llm_post_save_verified'
+			)
+		) {
+			return;
+		}
+
+		if (!current_user_can('edit_post', $post_id)) {
+			return;
+		}
+
+		$value = isset($_POST['llm_post_verified_field'])
+			? llm_post_sanitize_verified_date(
+				sanitize_text_field(wp_unslash($_POST['llm_post_verified_field']))
+			)
+			: '';
+
+		if ('' === $value) {
+			delete_post_meta($post_id, 'llm_post_verified');
+		} else {
+			update_post_meta($post_id, 'llm_post_verified', $value);
+		}
+	}
+);
+
+/**
+ * Return the "Updated" and "Verified" dates of an LLM post.
+ *
+ * - Updated:  the post's last modified date (automatic).
+ * - Verified: the custom field `llm_post_verified` (YYYY-MM or
+ *   YYYY-MM-DD), set when someone has actually checked that the content is
+ *   still correct. If it is not set, it falls back to the Updated date, so
+ *   every post carries both dates; use the `llm_post_verified_date` filter
+ *   to change that (e.g. return '' to omit it when unset).
+ *
+ * Displayed dates use the format `Y-m` (e.g. 2026-09), filterable via
+ * `llm_post_date_format`. The `iso` values are full dates (Y-m-d) for
+ * machine-readable output.
+ *
+ * @param WP_Post $post Post object.
+ * @return array<string, array{display: string, iso: string}>
+ */
+function llm_post_get_dates(WP_Post $post): array
+{
+	/* Only LLM posts carry Updated/Verified dates. */
+	if ('llm_post' !== $post->post_type) {
+		return array();
+	}
+
+	$format = (string) apply_filters('llm_post_date_format', 'Y-m', $post);
+
+	$modified_iso = (string) mysql2date('Y-m-d', $post->post_modified, false);
+
+	$verified_iso = llm_post_sanitize_verified_date(
+		(string) get_post_meta($post->ID, 'llm_post_verified', true)
+	);
+
+	if ('' !== $verified_iso && 7 === strlen($verified_iso)) {
+		/* YYYY-MM: the machine-readable value stays month-precise. */
+		$verified_ts = strtotime($verified_iso . '-01 00:00:00 UTC');
+	} elseif ('' !== $verified_iso) {
+		$verified_ts = strtotime($verified_iso . ' 00:00:00 UTC');
+	} else {
+		$verified_ts = false;
+	}
+
+	$verified_display = false !== $verified_ts
+		? gmdate($format, $verified_ts)
+		: (string) mysql2date($format, $post->post_modified, false);
+
+	if (false === $verified_ts) {
+		$verified_iso = $modified_iso;
+	}
+
+	$verified_display = (string) apply_filters(
+		'llm_post_verified_date',
+		$verified_display,
+		$post
+	);
+
+	$dates = array(
+		'updated' => array(
+			'display' => (string) mysql2date($format, $post->post_modified, false),
+			'iso'     => $modified_iso,
+		),
+	);
+
+	if ('' !== $verified_display) {
+		$dates['verified'] = array(
+			'display' => $verified_display,
+			'iso'     => $verified_iso,
+		);
+	}
+
+	return $dates;
+}
+
+/**
+ * The dates as one plain-text line: "Updated: 2026-09 Verified: 2026-09".
+ *
+ * @param WP_Post $post Post object.
+ * @return string
+ */
+function llm_post_get_dates_line(WP_Post $post): string
+{
+	$parts = array();
+
+	foreach (llm_post_get_dates($post) as $key => $date) {
+		$parts[] = ucfirst($key) . ': ' . $date['display'];
+	}
+
+	return implode(' ', $parts);
+}
+
+/**
+ * Advertise the LLM post identifier and dates in the HTML <head>.
  *
  * This works even when the active theme supplies the single-post template.
  */
@@ -623,15 +872,23 @@ add_action(
 		echo '<meta name="llm-post-id" content="'
 			. esc_attr(llm_post_get_identifier($post))
 			. '">' . "\n";
+
+		foreach (llm_post_get_dates($post) as $key => $date) {
+			echo '<meta name="llm-post-' . esc_attr($key) . '" content="'
+				. esc_attr($date['iso'])
+				. '">' . "\n";
+		}
 	},
 	20
 );
 
 /**
- * Add the identifier visibly to the rendered LLM post content.
+ * Add the identifier and the Updated/Verified dates visibly to the rendered
+ * LLM post content.
  *
- * This also makes the identifier available to normal HTML/theme templates,
- * while the Markdown representation gets it separately in its front matter.
+ * This also makes them available to normal HTML/theme templates, while the
+ * Markdown representation gets them separately (front matter + a line at
+ * the top of the body).
  */
 add_filter(
 	'the_content',
@@ -653,9 +910,21 @@ add_filter(
 
 		$identifier = llm_post_get_identifier($post);
 
+		$dates_html = array();
+
+		foreach (llm_post_get_dates($post) as $key => $date) {
+			$dates_html[] = esc_html(ucfirst($key)) . ': <time datetime="'
+				. esc_attr($date['iso']) . '">'
+				. esc_html($date['display'])
+				. '</time>';
+		}
+
 		return '<p class="llm-post-identifier"><strong>ID:</strong> '
 			. esc_html($identifier)
 			. '</p>'
+			. ('' !== implode('', $dates_html)
+				? '<p class="llm-post-dates">' . implode(' ', $dates_html) . '</p>'
+				: '')
 			. $content;
 	},
 	5
@@ -741,6 +1010,11 @@ function llm_post_to_markdown(WP_Post $post): string
 	$front_matter .= 'id: ' . llm_post_yaml_scalar(llm_post_get_identifier($post)) . "\n";
 	$front_matter .= 'title: ' . llm_post_yaml_scalar(llm_post_plain_text(get_the_title($post))) . "\n";
 	$front_matter .= 'date: ' . llm_post_yaml_scalar(get_the_date('c', $post)) . "\n";
+
+	foreach (llm_post_get_dates($post) as $key => $date) {
+		$front_matter .= $key . ': ' . llm_post_yaml_scalar($date['display']) . "\n";
+	}
+
 	$front_matter .= 'author: ' . llm_post_yaml_scalar(
 		get_the_author_meta('display_name', $post->post_author)
 	) . "\n";
@@ -757,6 +1031,13 @@ function llm_post_to_markdown(WP_Post $post): string
 	 * without touching the inside of fenced code blocks.
 	 */
 	$markdown = trim(llm_post_collapse_blank_lines($markdown));
+
+	/* "Updated: 2026-09 Verified: 2026-09" as a visible line before the content. */
+	$dates_line = llm_post_get_dates_line($post);
+
+	if ('' !== $dates_line) {
+		$markdown = $dates_line . "\n\n" . $markdown;
+	}
 
 	/*
 	 * FIX: the site-wide header/footer are meant for LLM posts only.
